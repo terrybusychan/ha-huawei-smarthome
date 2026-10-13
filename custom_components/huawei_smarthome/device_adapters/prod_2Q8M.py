@@ -106,6 +106,25 @@ Profile 的 enumList 里 ``enumVal`` 一律是**字符串**（如 ``"1"``），
 取值本身从 Profile 的 enumList 读取，不硬编码。
 
 =====================================================================
+为什么诊断实体默认不创建
+=====================================================================
+`netInfo`（Wi-Fi 信号格数 / RSSI / IP / SSID / BSSID）与 `update.version`
+（固件版本）这 6 个实体在真机上**全部长期为 unknown** —— 设备不上报这些
+读取字段，集成侧也没有别的读取路径可以拿到。
+
+保留它们只会让设备页被一堆永远没有值的实体占满，用户还会以为是集成坏了。
+因此**默认不创建**。
+
+代码并未删除，而是收进 ``_make_diagnostic_entities()``，由模块级开关
+``_ENABLE_DIAGNOSTIC_ENTITIES``（当前 False）控制。
+若日后在真机上确认这些字段**确实会上报**（例如固件升级后行为改变），
+把该开关改为 True 即可全部恢复，无需重新实现。
+
+注意：开关打开后取值逻辑仍是原样——按 Profile 字段读取，不做任何猜测；
+设备不上报时依然显示 unknown。这是刻意的：宁可显示 unknown，
+也不给一个编造出来的网络状态。
+
+=====================================================================
 尚未验证（需真机确认）
 =====================================================================
 [ ] 状态读取：全部字段未在真机实测，仅依据 Profile 权限/枚举推导。
@@ -134,6 +153,12 @@ from typing import Any
 
 from .api import EntitySpec
 from .context import DeviceContext
+
+# 诊断实体（netInfo / update）总开关。
+# 真机实测：这些实体全部为 unknown，设备不上报对应字段。
+# 默认关闭以免污染界面；若日后确认真机会上报，改为 True 即可恢复。
+_ENABLE_DIAGNOSTIC_ENTITIES = False
+
 
 # --- 服务/字段常量（本机 Profile，不与 2RJB 共享） -------------------
 _PIR_SID = "pir"
@@ -748,16 +773,35 @@ class Product2Q8MAdapter:
                 )
             )
 
-        # --- 固件版本（诊断） -----------------------------------------
-        if context.has_service("update"):
-            entities.append(
-                _make_sensor(
-                    "update", "version", "firmware_version", "固件版本",
-                    entity_category="diagnostic", decode=_text,
-                )
-            )
+        # --- 诊断实体（默认关闭，见文件头说明） ----------------------
+        if _ENABLE_DIAGNOSTIC_ENTITIES:
+            entities.extend(_make_diagnostic_entities(context))
 
         return tuple(entities)
 
+
+
+def _make_diagnostic_entities(
+    context: DeviceContext,
+) -> tuple[EntitySpec, ...]:
+    """Build the netInfo / update diagnostic entities.
+
+    默认不创建（见 ``_ENABLE_DIAGNOSTIC_ENTITIES``）。代码保留是为了：
+    若日后在真机上确认这些字段**确实会上报**，把开关打开即可恢复，
+    无需重新实现。取值逻辑未做任何猜测，仍是按 Profile 的字段读取。
+    """
+
+    out: list[EntitySpec] = []
+
+    # --- 固件版本（诊断） -----------------------------------------
+    if context.has_service("update"):
+        out.append(
+            _make_sensor(
+                "update", "version", "firmware_version", "固件版本",
+                entity_category="diagnostic", decode=_text,
+            )
+        )
+
+    return tuple(out)
 
 ADAPTER = Product2Q8MAdapter()
