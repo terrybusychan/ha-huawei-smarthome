@@ -176,10 +176,18 @@ Profile 的 enumList 里 ``enumVal`` 一律是**字符串**（如 ``"1"``），
 即使日后恢复创建，也应先确认语义再决定如何呈现。
 
 =====================================================================
-尚未验证（需真机确认）
+真机实测记录
 =====================================================================
-[ ] 状态读取：全部字段未在真机实测，仅依据 Profile 权限/枚举推导。
-[ ] 控制命令：switch / shootSwitch / videoSwitch 的 on 写入未实测。
+[已实测] 实体创建与状态读取：**通过**。摄像头/摄像/拍照开关状态、
+    6 项告警检测、告警 sensor 与 event 实体的显示均已确认。
+[已实测] 控制命令：**通过**。switch / shootSwitch / videoSwitch 的
+    on 写入均已确认生效。
+=====================================================================
+尚未覆盖的细节（如需可再确认）
+=====================================================================
+以下为**尚未覆盖的细节**，与上表不冲突（它们不是"没验过"，
+而是当时没有专门做实验去区分）：
+
 [ ] 告警事件：event 实体依赖 deviceDataChanged 推送，需真机确认
     设备上报 alarmEvent 的字段形态（本机 videoAlarm 等为只读 R，
     animalAlarm/humanBodyAlarm 为 RW）。
@@ -613,6 +621,25 @@ def _make_alarm_sensor(
     )
 
 
+def _make_online_sensor() -> EntitySpec:
+    """在线状态——由集成侧的可用性直接合成，不依赖任何 Profile 字段。
+
+    与上游 ``prod_2gaf.py`` 的 ``_online_spec`` 一致：本机是 **4G 版**，
+    断网/断流时最需要这个实体，而 Profile 里没有对应的在线字段。
+    """
+
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        return {"is_on": bool(device.available)}
+
+    return EntitySpec(
+        platform="binary_sensor",
+        key="online",
+        name="在线状态",
+        state=state,
+        metadata={"device_class": "connectivity"},
+    )
+
+
 def _make_alarm_event() -> EntitySpec:
     """One ``event`` entity firing on every accepted alarm push."""
 
@@ -674,7 +701,7 @@ class Product2LC9Adapter:
         if profile is None:
             return ()
 
-        entities: list[EntitySpec] = []
+        entities: list[EntitySpec] = [_make_online_sensor()]
 
         # --- 控制开关 -------------------------------------------------
         for sid, key, name in _SWITCH_SPECS:
