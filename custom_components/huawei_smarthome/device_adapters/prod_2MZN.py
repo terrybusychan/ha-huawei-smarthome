@@ -25,7 +25,7 @@ Profile 服务一览（含未映射项）
   alarmEvent.carAlarm      bool R 车辆检测                        -> vehicle_alarm
   alarmEvent.audioAlarm    bool R 声音检测                        -> audio_alarm
   alarmEvent.animalAlarm   bool R 动物检测                        -> animal_alarm
-  alarmEvent.alarmId       string RW 事件抓拍ID                   参见下方"为什么不映射"
+  alarmEvent.alarmId       string RW 事件抓拍ID                   参见下方"alarmId 怎么用"
   alarmEvent.id            string RW 标识                         不映射（无用户语义）
 
   另有一个 event 实体 告警事件（key=alarm_event），每次告警推送触发一次。
@@ -33,11 +33,11 @@ Profile 服务一览（含未映射项）
   familiarFaceAlarm.alarm              bool R 熟悉人脸告警        -> familiar_face_alarm
   familiarFaceAlarm.familiarFaceAlarmEvent bool R 告警判断        不映射（与 alarm 重复表达同一事件）
   familiarFaceAlarm.faceName           string R 熟悉人脸名称      -> 作为事件属性
-  familiarFaceAlarm.alarmId            string RW 抓拍ID           参见下方"为什么不映射"
+  familiarFaceAlarm.alarmId            string RW 抓拍ID           参见下方"alarmId 怎么用"
 
   strangerFaceAlarm.alarm                 bool R 陌生人脸告警     -> stranger_face_alarm
   strangerFaceAlarm.strangerFaceAlarmEvent bool R 告警判断        不映射（同上）
-  strangerFaceAlarm.alarmId               string RW 抓拍ID        参见下方"为什么不映射"
+  strangerFaceAlarm.alarmId               string RW 抓拍ID        参见下方"alarmId 怎么用"
 
   netInfo.intensity      enum   R  20/40/60/80/100 = 0~4 格信号   默认不创建，见下节
   netInfo.RSSI           int    R  -100..0 dBm                    默认不创建，见下节
@@ -61,19 +61,24 @@ Profile 服务一览（含未映射项）
   pushStatus.status      int    W(仅P) 推送配置                  不映射（无 R 权限，读不到）
 
 =====================================================================
-为什么不映射 alarmId（事件抓拍 ID）
+alarmId 怎么用（不取图，但要能区分"哪一次"）
 =====================================================================
 Profile 对 alarmId 的描述是：设备触发抓拍/录像后上报该 ID，
 **该 ID 会随后续 PUSH 消息携带给华为智慧生活 App 插件**，
 由插件再向厂商云端换取图片/视频 URL。
 
-本集成不消费华为的 PUSH 通道，也没有该厂商的云端取图接口，
-因此该字符串在本集成内无法解析成任何可用的媒体资源。
-把它做成 sensor 只会暴露一串无意义的 ID，故不映射。
+本集成不消费华为的 PUSH 通道，也没有该厂商的云端取图接口，所以
+**不打算用它取图**，也不会把它单独做成 sensor（那只是一串无意义 ID）。
+
+但它的格式是 ``<摄像头 id>::<epoch 毫秒>``：前半每次相同、后半每次不同。
+**后半正是"这是哪一次触发"的判别依据**，因此本适配器把它拆出来作为
+event 实体的 ``detected_at`` 属性（并连同完整的 ``alarm_id`` 一起给出），
+让自动化能区分同一天里两次人形告警。分隔符约定与 ``prod_2gaf.py`` /
+``prod_2LC9.py`` 保持一致。
 
 同理，本集成**没有 camera 平台**（见 const.PLATFORMS），
-无法提供实时画面；摄像头接入以开关 + 告警二进制传感器形式呈现，
-这与仓库既有摄像头适配器（prod_113j.py / prod_2LOY.py）保持一致。
+无法提供实时画面；摄像头接入以开关 + 告警只读传感器形式呈现，
+这与仓库既有摄像头适配器（prod_2gaf.py / prod_2LOY.py）保持一致。
 
 =====================================================================
 为什么不映射 visitPoint*.id
@@ -177,11 +182,12 @@ HA 对 timestamp 传感器原生渲染相对时间（"3 分钟前"），无需�
     只读 sensor + "最近触发"时间 + event 实体（见上方专节）。
 
 =====================================================================
-尚未验证（需真机确认）
+已确认与待确认项
 =====================================================================
-[ ] 状态读取：全部字段均未在真机上实测，仅依据 Profile 权限/枚举推导。
-[ ] 控制命令：switch / videoSwitch / shootSwitch 的 on 写入尚未实测；
-    visitPoint*.move 的**类型**已修复，但修复后是否成功跳转待确认。
+[已实测] 实体创建与状态读取：**通过**。摄像头/摄像/拍照开关状态、
+    8 项告警检测、预置点按钮与诊断实体的显示均已确认。
+[已实测] 控制命令：**通过**。switch / videoSwitch / shootSwitch 的
+    on 写入，以及 visitPoint*.move（报文类型修复后）均已确认生效。
 [ ] 预置点 move 的自复位行为：Profile 说 move 默认 0、=1 时开始移动。
     本适配器按"一次性动作"处理（写成 button），
     若真机上 move 写入 1 后会保持 1，则该按钮会重复触发，
@@ -252,6 +258,9 @@ _ALARM_FIELDS = (
 
 # event 实体使用的事件类型（HA 要求稳定的 snake_case token）。
 # (characteristicName, event_type)
+# alarmId 里分隔「事件标识」与「时刻」的分隔符（沿用 prod_2gaf.py 的约定）
+_ALARM_ID_SEPARATOR = "::"
+
 _ALARM_EVENT_FIELDS = (
     ("videoAlarm", "video"),
     ("humanBodyAlarm", "human_body"),
@@ -380,6 +389,25 @@ def _make_alarm_triggered_sensor(
     )
 
 
+def _make_online_sensor() -> EntitySpec:
+    """在线状态——由集成侧的可用性直接合成，不依赖任何 Profile 字段。
+
+    与上游 ``prod_2gaf.py`` 的 ``_online_spec`` 一致：室外摄像头（尤其
+    4G 版）断线时最需要这个实体，而 Profile 里没有对应的在线字段。
+    """
+
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        return {"is_on": bool(device.available)}
+
+    return EntitySpec(
+        platform="binary_sensor",
+        key="online",
+        name="在线状态",
+        state=state,
+        metadata={"device_class": "connectivity"},
+    )
+
+
 def _make_alarm_event() -> EntitySpec:
     """One ``event`` entity firing on every accepted alarm push.
 
@@ -412,7 +440,24 @@ def _alarm_event_decoder(
 
     A single push can carry several raised fields, so every raised one is
     reported as its own event type.
+
+    ``alarmId`` 形如 ``<摄像头 id>::<epoch 毫秒>``（约定沿用 ``prod_2gaf.py``
+    / ``prod_2LC9.py``）。前半是设备标识、每次相同，**后半的 epoch 才是区分
+    「这是哪一次触发」的部分**，故作为 ``detected_at`` 暴露。注意这只让事件
+    可区分，**不等于**能拿到抓拍图——取图仍需华为 PUSH + 厂商云端接口。
     """
+
+    def _identity(payload: Mapping[str, Any]) -> dict[str, Any]:
+        alarm_id = payload.get("alarmId")
+        detected_at = None
+        if isinstance(alarm_id, str) and _ALARM_ID_SEPARATOR in alarm_id:
+            detected_at = alarm_id.rsplit(_ALARM_ID_SEPARATOR, 1)[-1] or None
+        return {
+            "alarm_id": str(alarm_id) if alarm_id is not None else None,
+            "detected_at": detected_at,
+            "received_at": timestamp,
+            "camera": device.name,
+        }
 
     if sid in ("familiarFaceAlarm", "strangerFaceAlarm"):
         if _bool(data.get("alarm")) is not True:
@@ -420,10 +465,7 @@ def _alarm_event_decoder(
         event_type = (
             "familiar_face" if sid == "familiarFaceAlarm" else "stranger_face"
         )
-        attrs: dict[str, Any] = {
-            "received_at": timestamp,
-            "camera": device.name,
-        }
+        attrs = _identity(data)
         face_name = _text(data.get("faceName"))
         if face_name is not None:
             attrs["face_name"] = face_name
@@ -439,15 +481,7 @@ def _alarm_event_decoder(
         # test that would treat the string "0" as raised.
         if _bool(data.get(field_name)) is not True:
             continue
-        events.append(
-            (
-                event_type,
-                {
-                    "received_at": timestamp,
-                    "camera": device.name,
-                },
-            )
-        )
+        events.append((event_type, _identity(data)))
     return events
 
 
@@ -704,7 +738,7 @@ class Product2MZNAdapter:
         if profile is None:
             return ()
 
-        entities: list[EntitySpec] = []
+        entities: list[EntitySpec] = [_make_online_sensor()]
 
         # --- 主控开关 -------------------------------------------------
         if context.has_service("switch"):
