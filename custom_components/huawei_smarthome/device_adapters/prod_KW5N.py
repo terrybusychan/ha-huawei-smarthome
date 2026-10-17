@@ -22,74 +22,107 @@ lockStatus / event 的枚举空间，但本机 Profile 有明显差异（见下�
    用户名单               users                  users（同）
 
 =====================================================================
-Profile 服务一览（含未映射项）
+实体范围（只读适配器）
 =====================================================================
-  lockStatus.status        int  RW 1=门未关异常上锁 2=已开锁 3=已上锁 4=已关门 6=已反锁
-                                                    -> lock + door + lock_status
-  networkConnectState.state int R 0=离线 1=休眠 2=在线 -> connectivity (binary_sensor)
-  doorBattery.level        int  R -1~100             -> door_battery
-  catEyeBattery.level      int  R -1~100             -> cat_eye_battery
-  lockAlarm.alarm          int  R 1=故障 2=低电量 3=长期未上线 -> alarm + low_battery
+本适配器**不向门锁发送任何控制指令**。共 11 个实体：
 
-  event.*                  int/string R 操作与告警记录  -> event 实体（每次触发）
-    eventType / userName / userOperation(34 值) /
-    doorAlarmState(15 值) / recordType / alarmId / eventTime
+  # 基础状态
+  binary_sensor  door                门（开 / 关）
+  sensor         lock_status         门锁状态（文字）
+  binary_sensor  low_battery         低电量告警
 
-  securitySetting.*        8 项 RW                   -> 8 个 switch
-    isAuth / auth（管理员密码校验）                    不映射，见下方说明
-    deploymentSwitch       布防                    -> deployment
-    doubleCheckSwitch      双重验证                -> double_check
-    passwordVerificationSwitch 密码验证             -> password_verification
-    enableLockoutSwitch    锁定开关                -> enable_lockout
-    faceIdentifySwitch     人脸识别                -> face_identify
-    enableSenserOpenSwitch 传感器开门               -> sensor_open
+  # 电池电量（Profile 服务优先，回退未声明的 batteryManager）
+  sensor         battery             门锁电量 %      doorBattery.level
+  sensor         cat_eye_battery     猫眼电量 %      catEyeBattery.level
 
-  alarmEventSetting.*      10 开关 + 2 时间 + 2 枚举  -> 10 switch + 2 select
-    doorNotCLoseSwitch / unlockSwitch / lockBrokenSwitch /
-    forceUnlockedSwitch / alertModeUnlockedSwitch / lowBatterySwitch /
-    takeSnapshotSwitch / doorOpenSwitch / messagePushSwitch
-    outAlarmTime(3 档) / inAlarmTime(3 档)        -> 2 个 select
-    messagePushTime + startTime/endTime           不映射，见下方说明
+  # 门告警（逐码，便于按类型分别自动化）
+  binary_sensor  door_not_closed     门未关告警            das=1（或 status=1 兜底）
+  binary_sensor  door_ajar           门虚掩告警            das=2
+  binary_sensor  door_unlocked_fault 门未锁(故障)告警       das=3
+  binary_sensor  door_long_closed    长时间未开门           das=15
+  binary_sensor  door_open_problem   门未关/虚掩/未锁告警   上述 1+2+3 的汇总
 
-  catEyeSetting.*          5 开关 + 5 枚举 + 2 时间   -> 5 switch + 5 select
-    staySnapshotSwitch / liveVideoSwitch / distortionCorrectionSwitch /
-    takeSnapshotSwitch / shimmerFullColorSwitch
-    stayDuration(13 档) / shootingInterval(6 档) / shootingDuration(3 档) /
-    callValidPeriod(5 档) / detectDistance(3 档)
-    startTime/endTime（生效时段）                  不映射，见下方说明
+  # 事件（每次开锁 / 上锁 / 告警都 fire）
+  event          lock_event          门锁事件（event_types: unlock/lock/alarm）
 
-  volumeSetting.*          8 项                     -> 部分 switch
-    nightModeSwitch        夜间模式                -> night_mode
-    ringVolume/keyVolume/voiceVolume/currentRing     不映射，见下方说明
-    supportedRing(只读)                             不映射（能力位图）
-    startTime/endTime                               不映射（时段）
+数据来源：
+  lockStatus.status     int R 1=门未关异常上锁 2=已开锁 3=已上锁
+                           4=已关门 6=已反锁        -> door + lock_status
+                                                     + door_not_closed 的兜底
+  lockAlarm.alarm       int R 1=故障 2=低电量 3=长期未上线
+                                                    -> low_battery（低电量=2）
+  doorBattery.level / catEyeBattery.level
+                        int R -1~100    -> battery / cat_eye_battery
+                           读不到时回退 batteryManager.lithiumBatteryLevel /
+                           accumulatorBatteryLevel（Profile 未声明的服务）
+  event.doorAlarmState  int R 1=门未关 2=门虚掩 3=门未锁(故障) 4=低电
+                           15=长时间未开门 等 15 档 -> 逐码门告警
 
-  temporaryCipher.periodicCiper  object RW 临时密码 不映射（见下方说明）
-  users.userList / ciphers.cipher / faces.face /
-  fingers.finger / keyCards.keyCard / watchs.watch /
-  walletKeys.walletKey     object R 凭据名单          不映射（见下方说明）
+★ 关于"最近开锁 / 开门方向 / 最近告警"这几个实体：
+  上一版曾按事件流做过，但真机反馈**始终为空**（事件链路拿不到数据），
+  故**已全部移除**，避免在 PR 中留下永远不更新的实体。
+  门锁事件 ``event.lock_event`` 仍保留——它是"每次触发都响应"的通道，
+  自动化应基于它而不是基于状态实体。
 
-  update.*                 OTA 全流程                不映射（与其它适配器一致）
-  netInfo.*                网络                       -> 诊断传感器
+★★ 事件数据靠 `device.service_state()` 读取 ★★
+  `event` 服务的 serviceType 是 "event"，字段 report=None / perm=None——
+  它属于**一次性推送**，由框架交给 ``event_decoder`` 转成 HA 事件，
+  **不会写进 ``device.value()`` 的状态存储**。
+  同时解码器每次推送也会自己落盘一份（``_EVENT_LATCH``），两条来源合并读取。
+  注意线上字段是**短名**：``up``=userOperation、``das``=doorAlarmState、
+  ``un``=userName、``et``=eventTime；本文件两者都读，谁有值用谁。
+
+⚠️ 两套告警码不要混用：
+  ``lockAlarm.alarm=2`` 是**低电量**，而 ``event.doorAlarmState=2`` 是
+  **门虚掩告警**。它们是两个不同的枚举空间，故分别用
+  ``_ALARM_LOW_BATTERY`` 与 ``_EVENT_ALARM_LOW_BATTERY`` 两个常量。
+
+**告警语义**：门锁对每次事件只推一次、**从不推"已清除"**，因此这些
+binary_sensor 表达的是"**该告警最近发生过**"，而不是"此刻正在发生"。
+每次置位时属性里带 ``last_triggered``，要判断"多久之前"请看它。
+这是设备行为决定的，不是适配器的取舍。需要"每次触发都响应"的自动化，
+请用 ``event.lock_event``。
+
+**刻意不暴露的项**（真机验证后收敛，理由见下）：
+  * securitySetting 6 个开关、alarmEventSetting 10 开关 + 2 时长、
+    catEyeSetting 5 开关 + 5 枚举、volumeSetting.nightModeSwitch
+    —— 全部为控制项，已移除。
+  * 诊断实体 —— 已移除：netInfo（信号/RSSI/IP/SSID/BSSID）与
+    update.version 在真机上**全部长期为 unknown**，设备不上报；
+    networkConnectState（连接状态 / 网络状态）也不再暴露。
+  * temporaryCipher.periodicCiper（临时密码）与
+    users/ciphers/faces/fingers/keyCards/watchs/walletKeys
+    （7 类凭据名单）—— 不映射，见下方说明。
+  * update.*（OTA 全流程）、supportedRing（能力位图）、各时段字段
+    （startTime / endTime / messagePushTime）—— 不映射。
 
 =====================================================================
-【安全第一】为什么 lock/unlock 做成"拒绝动作"
+为什么不提供 lock（上锁 / 开锁）实体
 =====================================================================
 本机 Profile 把 ``lockStatus.status`` 声明为 RW，因此适配器**有资格**
 注册 lock / unlock 动作。但同系列门锁（KW02，见仓库既有适配器说明）
 的固件行为是：**接受写入后回 errcode=0，然后立刻重新上报未改变的
 状态**——即"假成功"。华为智慧生活 App 也**不提供**该系列的远程开锁。
 
-HA 的 lock 实体无论如何都会渲染"上锁/解锁"按钮。如果适配器不注册
-动作，按下会抛通用的 "adapter action is unavailable"；如果照 Profile
-注册，就会向门锁发出真实指令，存在**远程开锁的安全风险**，而且很可能
-是假成功（用户以为开了、其实没开，或反之）。
+早先的版本保留了一个 lock 实体、但把动作做成"显式拒绝"（按下报错、
+不发报文）。作者真机实测后确认：**这个实体没有任何用处**——它既不
+能上锁也不能开锁，只是给用户多了一个点了就报错的按钮。
 
-因此本适配器**注册显式拒绝动作**：按下按钮立即抛出可自解释的错误，
-**不向门锁发送任何数据**。这既诚实又安全。
+因此**直接不注册 lock 实体**：设备页上没有上锁/解锁入口，锁的真实
+状态由只读的 ``sensor.lock_status`` 表达。若日后确认该型号支持远程
+开锁，再新增 lock 实体并实现真实写入。
 
-若日后真机确认该型号支持远程开锁，应把 _refusal_action 替换为实际
-写入动作，并同步更新本说明。
+=====================================================================
+电池电量的两个来源
+=====================================================================
+Profile 声明 ``doorBattery.level`` / ``catEyeBattery.level``，但同系列机型
+（AGS-E211 / KW02）实测**从不上报**这两个服务，真实电量走 Profile
+**未声明**的 ``batteryManager``：
+  ``lithiumBatteryLevel``     -> 锁体电量
+  ``accumulatorBatteryLevel`` -> 猫眼电量
+故本适配器**先读 Profile 服务、读不到再回退 batteryManager**；
+两处都没有就显示 unknown，且 ``level=-1`` 是占位值、不是真实百分比。
+（来源：上游 ``prod_KW59.py`` 的真机记录。）
 
 =====================================================================
 为什么不映射 temporaryCipher（临时密码）
@@ -144,53 +177,51 @@ id / nm / ct / rd / st / et / act —— 其中 **ct 极可能是密码明文本
 _is_writable() 判断可写性，改为按 ``method`` 是否含 "W" 判断。
 
 =====================================================================
-为什么诊断实体默认不创建
-=====================================================================
-`netInfo`（Wi-Fi 信号格数 / RSSI / IP / SSID / BSSID）与 `update.version`
-（固件版本）这 6 个实体在真机上**全部长期为 unknown** —— 设备不上报这些
-读取字段，集成侧也没有别的读取路径可以拿到。
+真机实测：以下诊断字段**全部长期为 unknown** —— 设备不上报这些读取
+字段，集成侧也没有别的读取路径可以拿到：
+  * `netInfo`（Wi-Fi 信号格数 / RSSI / IP / SSID / BSSID）
+  * `update.version`（固件版本）
+  * `networkConnectState.state`（连接状态 / 网络状态）
 
-保留它们只会让设备页被一堆永远没有值的实体占满，用户还会以为是集成坏了。
-因此**默认不创建**。
-
-代码并未删除，而是收进 ``_make_diagnostic_entities()``，由模块级开关
-``_ENABLE_DIAGNOSTIC_ENTITIES``（当前 False）控制。
-若日后在真机上确认这些字段**确实会上报**（例如固件升级后行为改变），
-把该开关改为 True 即可全部恢复，无需重新实现。
-
-注意：开关打开后取值逻辑仍是原样——按 Profile 字段读取，不做任何猜测；
-设备不上报时依然显示 unknown。这是刻意的：宁可显示 unknown，
-也不给一个编造出来的网络状态。
+它们已**从本文件移除**（此前是默认不创建、代码保留在
+``_make_diagnostic_entities()``）。移除而非隐藏，是因为它们对用户
+没有任何可读信息，保留代码只会让后续维护者以为"打开开关就能用"。
 
 =====================================================================
-尚未验证（需真机确认）
+真机实测记录
 =====================================================================
-[ ] 状态读取：全部字段未在真机实测，仅依据 Profile 定义推导。
-[ ] 控制命令：8 个 securitySetting switch、10 个 alarmEventSetting
-    switch、5 个 catEyeSetting switch、2+5 个 select、1 个 night_mode
-    switch，均未实测。
-[ ] **lockStatus 的过渡值**：同系列固件会上报 Profile 未声明的值
-    （KW02 观察到 7）。本适配器沿用"保留最后一个已声明状态"的做法，
-    真机若上报新值需确认是否要补标签。
-[ ] **门锁是否支持远程开锁**：见上方安全说明。装机后请勿依赖 HA
-    的解锁按钮；请在 App 内或门锁面板操作。
-[ ] doorBattery / catEyeBattery 是否实际上报未验证。同系列机型
-    （AGS-E211 / KW02）**从不上报这两个服务**，电量走 Profile 未声明
-    的 batteryManager。本适配器只读 Profile 声明的服务；若真机这两项
-    长期为空，需要按同系列的做法补 batteryManager 回退。
-[ ] lockAlarm 是否上报未验证（同系列恒为空）。当前 alarm / low_battery
-    会回退到 event.doorAlarmState。
-[ ] networkConnectState.state=1（休眠）在 HA connectivity 上如何呈现
-    未验证；当前只有 2（在线）视为连通。
-[ ] event.userOperation 的 34 个枚举与 doorAlarmState 的 15 个枚举
-    是否与 App 显示一致未验证。
-[ ] update.action 的字段类型是 string（"0"/"1"）而其它枚举是 int，
-    写入格式未验证；本适配器不映射 OTA。
-[ ] netInfo 各字段设备是否实际上报未验证（诊断类，不影响主功能）。
+验证环境：真实设备（华为智能门锁 2 Ultra / AGS-X25）+ 智慧生活 App 对照。
+
+[已实测] 实体创建与状态读取：**通过**。
+[已实测] `door`（门）/ `lock_status`（门锁状态文字）：**与 App 一致**，
+    上锁 / 开锁 / 反锁 各测一次均正确。
+[已实测] `low_battery`（低电量告警）：正常时为 off。
+[已实测] `battery` / `cat_eye_battery`（门锁 / 猫眼电量）：**有真实读数**。
+[已实测] `door_not_closed`（门未关告警）：**通过**——由
+    `lockStatus.status=1`（门未关异常上锁）判定，不依赖事件推送。
+[已实测·已删除] 以下几项在真机上**始终为空**，已从适配器中移除，
+    以免 PR 里留下永远不更新的实体：
+      * `last_unlock`（最近开锁）、`last_unlock_time`（最近开锁时间）
+      * `open_direction`（开门方向）
+      * `last_alarm`（最近门锁告警）
+      * `event_raw`（诊断用，随上面几项一并撤掉）
+    根因：`event` 服务是**一次性推送**（serviceType="event"，
+    字段 report/perm 均为 None），本机始终没能取到它的数据；
+    即使同时用 `service_state()` 与解码器落盘两条来源，也没能读到。
+
+[ ] 仍然保留、但**未在真机确认**的 event 依赖项：
+    `door_ajar`（das=2）、`door_unlocked_fault`（das=3）、
+    `door_long_closed`（das=15）、`door_open_problem`（三者汇总）、
+    `event.lock_event`（门锁事件）。它们与上面被删的几项共用同一条
+    event 数据来源，**很可能同样不会更新**。若真机确认它们也是空的，
+    应一并删除，让适配器只保留 lockStatus / lockAlarm 能支撑的实体。
+[ ] `lockStatus` 的过渡值：同系列固件会上报 Profile 未声明的值
+    （KW02 观察到 7）。本适配器沿用"保留最后一个已声明状态"的做法。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
@@ -198,11 +229,6 @@ from typing import Any
 
 from .api import EntitySpec
 from .context import DeviceContext
-
-# 诊断实体（netInfo / update）总开关。
-# 真机实测：这些实体全部为 unknown，设备不上报对应字段。
-# 默认关闭以免污染界面；若日后确认真机会上报，改为 True 即可恢复。
-_ENABLE_DIAGNOSTIC_ENTITIES = False
 
 
 _LOGGER = logging.getLogger(__name__)
@@ -250,7 +276,10 @@ _NET_STATE_ONLINE = 2  # 在线（1=休眠 不视为连通）
 _BATTERY_UNKNOWN = -1
 
 # --- 告警 ------------------------------------------------------------
-_ALARM_LOW_BATTERY = 2  # 低电量告警
+_ALARM_LOW_BATTERY = 2  # lockAlarm.alarm=2 低电量告警
+# event.doorAlarmState 是**另一套**码：2 在那里是「门虚掩告警」，
+# 低电在 event 里是 4。两者绝不能共用一个常量。
+_EVENT_ALARM_LOW_BATTERY = 4
 _NO_ALARM = "无告警"
 # lockAlarm 一旦置位不会自动清除；超过该窗口的读数不再当作"当前"告警。
 _ALARM_PULSE_WINDOW = timedelta(hours=12)
@@ -262,6 +291,35 @@ _EVENT_OPERATION_FIELD = "userOperation"
 _EVENT_DOOR_ALARM_FIELD = "doorAlarmState"
 _EVENT_ALARM_ID_FIELD = "alarmId"
 _EVENT_TIME_FIELD = "eventTime"
+
+# --- 门告警只读传感器 -------------------------------------------------
+# (key, 名称, event.das 触发码集合, lockStatus.status 兜底码集合)
+#   * 主要来源是 event 推送的 das（1=门未关 2=门虚掩 3=门未锁(故障) 15=长时间未开门）
+#   * `door_not_closed` 额外支持从 **lockStatus.status=1（门未关异常上锁）**
+#     判定——那是一个持久服务，可作为 event 读不到时的兜底。
+#   * status 码表：1=门未关异常上锁 2=已开锁 3=已上锁 4=已关门 6=已反锁
+_DOOR_ALARM_SENSORS = (
+    ("door_not_closed", "门未关告警", (1,), (1,)),
+    ("door_ajar", "门虚掩告警", (2,), ()),
+    ("door_unlocked_fault", "门未锁(故障)告警", (3,), ()),
+    ("door_long_closed", "长时间未开门", (15,), ()),
+)
+
+_DOOR_GROUP_SENSORS = (
+    (
+        "door_open_problem",
+        "门未关/虚掩/未锁告警",
+        ("door_not_closed", "door_ajar", "door_unlocked_fault"),
+    ),
+)
+
+_DOOR_GROUP_SENSORS = (
+    (
+        "door_open_problem",
+        "门未关/虚掩/未锁告警",
+        ("door_not_closed", "door_ajar", "door_unlocked_fault"),
+    ),
+)
 
 _EVENT_RECORD = 1
 _EVENT_ALARM = 2
@@ -481,30 +539,14 @@ def _enum_options(
 # ---------------------------------------------------------------------
 # 拒绝动作（安全关键）
 # ---------------------------------------------------------------------
-def _refusal_action(verb: str) -> Callable[..., Any]:
-    """返回一个显式拒绝的协程，**不向门锁发送任何数据**。
-
-    见文件头"安全第一"：同系列固件对 lockStatus 写入是"假成功"，
-    而 HA 的 lock 实体必然渲染上锁/解锁按钮。这里让按钮抛出自解释
-    错误，而不是发出一条可能真实开锁（或被静默忽略）的指令。
-    """
-
-    async def refuse(context: DeviceContext, data: Mapping[str, Any]) -> None:
-        del context, data
-        raise ValueError(f"该门锁不支持远程{verb}，请直接使用门锁面板或官方 App 操作")
-
-    return refuse
 
 
-# ---------------------------------------------------------------------
-# 状态读取
-# ---------------------------------------------------------------------
 def _status_reader() -> Callable[[DeviceContext], Any]:
-    """保留最后一个"已声明"的 lockStatus 值。
+    """返回一个"只接受已声明值"的 lockStatus 读取器。
 
-    固件可能上报 Profile 未声明的过渡值（同系列观察到 7）。返回上一个
-    已声明值可让 门锁 / 门 / 门锁状态 三个实体描述同一状态，
-    而不是被过渡值一起清空。
+    固件可能上报 Profile 未声明的过渡值（同系列观察到 7）。若直接照原样
+    返回，一个过渡值会同时把「门 / 门锁状态 / door_not_closed 的兜底」
+    一起变空。故只接受已声明的值，否则沿用上一个已知值。
     """
 
     cache: dict[str, Any] = {"status": None}
@@ -516,43 +558,6 @@ def _status_reader() -> Callable[[DeviceContext], Any]:
         return cache["status"]
 
     return read
-
-
-# ---------------------------------------------------------------------
-# 实体构造
-# ---------------------------------------------------------------------
-def _make_enum_switch(
-    context: DeviceContext,
-    sid: str,
-    field_name: str,
-    key: str,
-    name: str,
-) -> EntitySpec | None:
-    """0/1 枚举开关（本机设置项几乎都是 enum 而非 bool）。"""
-
-    field = _field(context.profile, sid, field_name)
-    if field is None or not _is_writable(field):
-        return None
-    on_value = _enum_value(field, 1, 1)
-    off_value = _enum_value(field, 0, 0)
-
-    async def turn_on(device: DeviceContext, _data: Mapping[str, Any]) -> None:
-        await device.async_send_service(sid, {field_name: on_value})
-
-    async def turn_off(device: DeviceContext, _data: Mapping[str, Any]) -> None:
-        await device.async_send_service(sid, {field_name: off_value})
-
-    return EntitySpec(
-        platform="switch",
-        key=key,
-        name=name,
-        state=lambda device: {
-            "is_on": _int(device.value(sid, field_name)) == 1
-            if device.value(sid, field_name) is not None
-            else None
-        },
-        actions={"turn_on": turn_on, "turn_off": turn_off},
-    )
 
 
 def _make_select(
@@ -653,6 +658,166 @@ def _battery_spec(sid: str, key: str, name: str) -> EntitySpec:
     )
 
 
+
+
+
+
+# ---------------------------------------------------------------------
+# 事件读取（与 prod_KW59.py 同系列做法）
+# ---------------------------------------------------------------------
+# 关键事实（取自上游 prod_KW59.py，同厂同系列门锁，已在真机验证）：
+#   * ``device.service_state(sid)`` 返回该服务**最后一次推送**的完整报文，
+#     集成自己保存了它 —— 不需要我们另建缓存；
+#   * 门锁在**线上用短字段名**推送，而 Profile 里叫长名：
+#         userOperation -> "up"      doorAlarmState -> "das"
+#         userName      -> "un"      eventTime      -> "et"
+#     两者都读、谁有值用谁，这样换固件也不会失配。
+#   * 一次推送只描述"刚刚发生的事"，所以"最近开锁"要用闭包缓存保住
+#     最后一个**开锁**记录，避免后续关门类记录把它覆盖。
+_WIRE_OPERATION = "up"
+_WIRE_ALARM = "das"
+_WIRE_USER = "un"
+_WIRE_TIME = "et"
+
+# 电池在部分同系列机型上走 Profile **未声明**的 batteryManager。
+# 这里作为回退源：读不到就不显示，不做任何猜测。
+_BATTERY_MANAGER_SID = "batteryManager"
+_BATTERY_LPM_FIELD = "lpmStatus"
+# batteryManager 上这两项对应锁体 / 猫眼的电量（同系列实测）
+_LITHIUM_BATTERY_FIELD = "lithiumBatteryLevel"
+_DRY_BATTERY_FIELD = "accumulatorBatteryLevel"
+_LPM_ACTIVE = 1
+
+
+# ---------------------------------------------------------------------
+# 事件数据的两个来源（关键）
+# ---------------------------------------------------------------------
+# 为什么要有两条：
+#   * 集成若提供 ``device.service_state(sid)``，它保存该服务**最后一次推送**；
+#   * 但较早的集成版本没有这个方法 —— 此时只能靠**解码器自己落盘**。
+# 真机反馈"最近开锁 / 开门方向全空"，说明单靠其中一条在本机拿不到数据，
+# 因此这里同时读两条：解码器落盘的（本次推送，更新）优先，service_state 兜底。
+_EVENT_LATCH: dict[str, dict[str, Any]] = {}
+
+
+def _latch_key(device: DeviceContext) -> str:
+    """一个稳定的 per-device 键，用于把推送按设备分开存放。"""
+
+    for attr in ("unique_id", "entity_id", "device_id", "id", "name"):
+        value = getattr(device, attr, None)
+        if isinstance(value, str) and value:
+            return value
+    return "default"
+
+
+def _service_state_record(device: DeviceContext) -> Mapping[str, Any]:
+    """集成保存的最后一次推送（旧集成没有该方法时返回空）。"""
+
+    getter = getattr(device, "service_state", None)
+    if not callable(getter):
+        return {}
+    try:
+        state = getter(_EVENT_SID)
+    except Exception:  # noqa: BLE001 - a bad read must not break the entity
+        return {}
+    return dict(state) if isinstance(state, Mapping) else {}
+
+
+def _event_record(device: DeviceContext) -> Mapping[str, Any]:
+    """合并「集成保存的最后一次推送」与「解码器落盘的推送」。
+
+    两条都是同一条推送的不同副本，字段应当一致；合并只是为了让**任意一条
+    可用**时实体就能工作（合并顺序不影响结果）。
+    """
+
+    merged: dict[str, Any] = dict(_service_state_record(device))
+    merged.update(_EVENT_LATCH.get(_latch_key(device), {}))
+    return merged
+
+
+def _remember_event(device: DeviceContext, data: Mapping[str, Any]) -> None:
+    """解码器每收到一次推送就落盘，供只读实体读取。"""
+
+    if len(_EVENT_LATCH) > 64:
+        _EVENT_LATCH.clear()
+    entry = _EVENT_LATCH.setdefault(_latch_key(device), {})
+    for key, value in data.items():
+        if value is not None:
+            entry[key] = value
+
+
+def _record_value(record: Mapping[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in record:
+            value = record.get(name)
+            if value is not None:
+                return value
+    return None
+
+
+def _record_operation(record: Mapping[str, Any]) -> int | None:
+    """userOperation, as the wire calls it ``up``."""
+
+    return _int(_record_value(record, _WIRE_OPERATION, _EVENT_OPERATION_FIELD))
+
+
+def _record_alarm(record: Mapping[str, Any]) -> int | None:
+    """doorAlarmState, as the wire calls it ``das``."""
+
+    return _int(_record_value(record, _WIRE_ALARM, _EVENT_DOOR_ALARM_FIELD))
+
+
+def _record_user(record: Mapping[str, Any]) -> str | None:
+    return _text(_record_value(record, _WIRE_USER, _EVENT_USER_NAME_FIELD))
+
+
+def _parse_stamp(value: Any) -> datetime | None:
+    """Parse a SmartHome stamp such as ``20260915T232350Z`` (tolerating ns).
+
+    ``service_updated_at`` / ``parse_remote_timestamp`` reject the fractional
+    ns form the live MQTT push carries, so it is handled here.  Anything
+    unparsable returns None -- never a guessed time.
+    """
+
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1]
+    if "T" not in text:
+        return None
+    whole, _, fraction = text.partition("T")
+    if not whole.isdigit():
+        return None
+    if "." in fraction:
+        try:
+            return datetime.strptime(
+                f"{whole}T{fraction}", "%Y%m%dT%H%M%S.%f"
+            ).replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    if not fraction.isdigit() or len(fraction) < 6:
+        return None
+    micros = (fraction[6:] + "000000")[:6]
+    try:
+        return datetime.strptime(
+            f"{whole}T{fraction[:6]}.{micros}", "%Y%m%dT%H%M%S.%f"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _event_time(device: DeviceContext, record: Mapping[str, Any]) -> datetime | None:
+    """When this record happened: its own ``et`` first, else the push time."""
+
+    parsed = _parse_stamp(_record_value(record, _WIRE_TIME, _EVENT_TIME_FIELD))
+    if parsed is not None:
+        return parsed
+    return _reported_at(device, _EVENT_SID)
+
+
+
+
 def _lock_alarm_is_stale(device: DeviceContext) -> bool:
     when = device.service_updated_at(_LOCK_ALARM_SID)
     if when is None:
@@ -660,17 +825,148 @@ def _lock_alarm_is_stale(device: DeviceContext) -> bool:
     return datetime.now(timezone.utc) - when > _ALARM_PULSE_WINDOW
 
 
-def _event_alarm_code(device: DeviceContext) -> int | None:
-    code = _int(device.value(_EVENT_SID, _EVENT_DOOR_ALARM_FIELD))
-    if code is None or code < 1:
+def _reported_at(device: DeviceContext, sid: str) -> datetime | None:
+    """Return when service ``sid`` last reported, tolerating ns-without-dot.
+
+    ``device.service_updated_at()`` 内部走 ``parse_remote_timestamp``，只接受
+    ``%Y%m%dT%H%M%S``（整秒）和**带小数点**的 ``...%H%M%S.%f``；而实时 MQTT
+    推送携带的时间戳是**不带小数点**的 9 位纳秒（形如
+    ``20260914T222156103Z``），会被判为不可解析而返回 None。
+
+    对"最近一次告警是什么时候"这个需求而言，None 恰好出现在**告警刚发生**
+    的时刻，正是最需要的时刻。因此这里补一条兜底：遇
+    ``YYYYMMDDTHHMMSS<多余数字>Z`` 时取前 6 位多余数字当微秒
+    （毫秒级排序足够表达"x 分钟前"）。解析失败一律返回 None，**绝不猜时间**。
+
+    （做法与 2MZN / 2LC9 的 ``_reported_at()`` 保持一致；KW02/KW38/KW4X
+    的文件头记录了同一 ts 形态现象。）
+    """
+
+    when = device.service_updated_at(sid)
+    if when is not None:
+        return when
+
+    raw = getattr(device, "_timestamps", None)
+    if not isinstance(raw, Mapping):
         return None
-    return code
+    value = raw.get(sid)
+    if not isinstance(value, str) or not value.endswith("Z"):
+        return None
+
+    body = value[:-1]
+    # 仅处理无小数点的形态；带小数点的已由 service_updated_at 覆盖。
+    if "." in body or "T" not in body:
+        return None
+    whole, _, fraction = body.partition("T")
+    if not whole.isdigit() or not fraction.isdigit() or len(fraction) <= 6:
+        return None
+    # 例：whole=20260914, fraction=222156103 -> 22:21:56.103000
+    micros = (fraction[6:] + "000000")[:6]
+    try:
+        return datetime.strptime(
+            f"{whole}T{fraction[:6]}.{micros}", "%Y%m%dT%H%M%S.%f"
+        ).replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
 
 
-# ---------------------------------------------------------------------
-# 事件解码
-# ---------------------------------------------------------------------
+
+
+
+
+def _make_door_alarm_sensor(
+    context: DeviceContext,
+    key: str,
+    name: str,
+    codes: tuple[int, ...],
+    status_codes: tuple[int, ...] = (),
+    read_status: Callable[[DeviceContext], Any] | None = None,
+) -> EntitySpec:
+    """One read-only door-alarm sensor.
+
+    主来源是 event 推送的 `das`；`status_codes` 非空时，若 event 读不到，
+    再回退到 `lockStatus.status`（持久服务，更可靠）。
+    """
+
+    wanted = frozenset(codes)
+    status_wanted = frozenset(status_codes)
+
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        record = _event_record(device)
+        code = _record_alarm(record)
+        if code is not None and code in wanted:
+            attributes: dict[str, Any] = {"raw": code, "source": "event"}
+            when = _event_time(device, record)
+            if when is not None:
+                attributes["last_triggered"] = when
+            return {"is_on": True, "extra_state_attributes": attributes}
+
+        # 兜底：从 lockStatus.status 判定（只有 door_not_closed 用得上）
+        if status_wanted and read_status is not None:
+            status = read_status(device)
+            if status in status_wanted:
+                return {
+                    "is_on": True,
+                    "extra_state_attributes": {
+                        "raw_status": status,
+                        "source": "lockStatus",
+                    },
+                }
+        return {"is_on": False}
+
+    return EntitySpec(
+        platform="binary_sensor",
+        key=key,
+        name=name,
+        state=state,
+        metadata={"device_class": "problem"},
+    )
+
+
+def _make_group_alarm_sensor(
+    name: str,
+    specs: list[EntitySpec],
+) -> EntitySpec:
+    """汇总传感器：任一成员告警为真即 ``is_on``。
+
+    用于"一条自动化覆盖门未关/虚掩/未锁三者"；成员传感器仍可单独使用。
+    """
+
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        triggered: list[str] = []
+        latest: datetime | None = None
+        for spec in specs:
+            result = spec.state(device) or {}
+            if result.get("is_on"):
+                triggered.append(spec.key)
+                when = (result.get("extra_state_attributes") or {}).get("last_triggered")
+                if isinstance(when, datetime) and (latest is None or when > latest):
+                    latest = when
+        if not triggered:
+            return {"is_on": False}
+        attributes: dict[str, Any] = {"triggered": triggered}
+        if latest is not None:
+            attributes["last_triggered"] = latest
+        return {"is_on": True, "extra_state_attributes": attributes}
+
+    return EntitySpec(
+        platform="binary_sensor",
+        key="door_open_problem",
+        name=name,
+        state=state,
+        metadata={"device_class": "problem"},
+    )
+
+
+
+
+
+
+
+
 def _operation_direction(operation: Any) -> str | None:
+    """Classify an operation code as indoor / outdoor unlock, else None."""
+
     number = _int(operation)
     if number is None:
         return None
@@ -684,23 +980,23 @@ def _operation_direction(operation: Any) -> str | None:
 def _event_kind(record: Mapping[str, Any]) -> str | None:
     """把一个事件记录分类为 unlock / lock / alarm。
 
-    分类顺序与本适配器自身状态实体保持一致，避免事件与传感器
-    对"发生了什么"给出矛盾说法。
+    兼容线上短名（up / das / un）与 Profile 长名，分类顺序与本适配器
+    自身状态实体保持一致，避免事件与传感器对"发生了什么"给出矛盾说法。
     """
 
-    alarm = _int(record.get(_EVENT_DOOR_ALARM_FIELD))
+    alarm = _record_alarm(record)
     if alarm is not None and alarm >= 1:
         return "alarm"
-    operation = _int(record.get(_EVENT_OPERATION_FIELD))
+    operation = _record_operation(record)
     if operation == 25:  # 反锁
         return "lock"
-    if _operation_direction(operation) is not None:
+    if operation is not None and (
+        operation in _UNLOCK_OPERATIONS
+        or operation in _INDOOR_UNLOCK_OPERATIONS
+    ):
         return "unlock"
     # 未描述的操作码 + 有用户名，视为凭据开锁记录。
-    user = _text(record.get(_EVENT_USER_NAME_FIELD))
-    if user is not None and (
-        _int(record.get(_EVENT_TYPE_FIELD)) == _EVENT_RECORD
-    ):
+    if _record_user(record) is not None:
         return "unlock"
     return None
 
@@ -721,12 +1017,19 @@ def _lock_event_decoder(
     if sid != _EVENT_SID:
         return []
 
-    kind = _event_kind(data)
+    # 关键：先落盘，这样即使集成没有 service_state，只读实体也能拿到数据。
+    _remember_event(device, data)
+
+    # 本次推送优先；缺失字段用该服务最后一次推送补齐（与 KW59 同做法）。
+    record: dict[str, Any] = dict(_event_record(device))
+    record.update(dict(data))
+
+    kind = _event_kind(record)
     if kind is None:
         # 凭据管理、布防、门铃等记录不产生事件。
         return []
 
-    operation = _int(data.get(_EVENT_OPERATION_FIELD))
+    operation = _record_operation(record)
     operation_field = _field(
         device.profile or {}, _EVENT_SID, _EVENT_OPERATION_FIELD
     )
@@ -735,16 +1038,63 @@ def _lock_event_decoder(
     )
 
     payload: dict[str, Any] = {
-        "alarm_id": _text(data.get(_EVENT_ALARM_ID_FIELD)),
-        "user": _text(data.get(_EVENT_USER_NAME_FIELD)),
-        "occurred_at": _text(data.get(_EVENT_TIME_FIELD)) or timestamp,
-        "method": _enum_label(operation_field, operation),
-        "direction": _operation_direction(operation),
+        "alarm_id": _text(_record_value(record, "alarmId", "aid", "eid")),
+        "user": _record_user(record),
+        "occurred_at": _record_value(record, _WIRE_TIME, _EVENT_TIME_FIELD) or timestamp,
+        "method": _enum_label(operation_field, operation) if operation is not None else None,
+        "direction": _operation_direction(operation) if operation is not None else None,
     }
-    alarm_code = _int(data.get(_EVENT_DOOR_ALARM_FIELD))
-    if kind == "alarm":
+    alarm_code = _record_alarm(record)
+    if kind == "alarm" and alarm_code is not None:
         payload["alarm"] = _enum_label(alarm_field, alarm_code)
     return [(kind, {k: v for k, v in payload.items() if v is not None})]
+
+
+
+
+def _battery_value(device: DeviceContext, sid: str) -> Any:
+    """Read one battery from its Profile service, ignoring the -1 placeholder."""
+
+    value = _number(device.value(sid, _BATTERY_LEVEL_FIELD))
+    if value is not None and value > _BATTERY_UNKNOWN:
+        return value
+    return None
+
+
+def _make_battery_sensor(
+    sid: str,
+    manager_field: str,
+    key: str,
+    name: str,
+) -> EntitySpec:
+    """电池电量（只读）。
+
+    先读 Profile 声明的服务（doorBattery / catEyeBattery），读不到再回退到
+    **Profile 未声明**的 ``batteryManager``——同系列机型实测就是这样上报的。
+    两处都读不到就显示 unknown，绝不猜一个数字。
+    """
+
+    def state(device: DeviceContext) -> Mapping[str, Any]:
+        value = _battery_value(device, sid)
+        if value is None:
+            value = _number(device.value(_BATTERY_MANAGER_SID, manager_field))
+            if value is not None and value <= _BATTERY_UNKNOWN:
+                value = None
+        return {"native_value": value}
+
+    return EntitySpec(
+        platform="sensor",
+        key=key,
+        name=name,
+        state=state,
+        metadata={
+            "device_class": "battery",
+            "unit": "%",
+            "state_class": "measurement",
+        },
+    )
+
+
 
 
 class ProductKW5NAdapter:
@@ -760,29 +1110,10 @@ class ProductKW5NAdapter:
         entities: list[EntitySpec] = []
         read_status = _status_reader()
 
-        # --- lock（只读；动作显式拒绝） -------------------------------
+        # 本适配器**只做只读感知**：门、门锁状态、低电量告警。
+        # 所有控制项（lock / switch / select）、事件实体与诊断实体均已移除，
+        # 见文件头「实体范围」一节。
         if context.has_service(_LOCK_STATUS_SID):
-
-            def lock_state(device: DeviceContext) -> Mapping[str, Any]:
-                status = read_status(device)
-                if status in _LOCKED_STATUSES:
-                    return {"is_locked": True}
-                if status in _UNLOCKED_STATUSES:
-                    return {"is_locked": False}
-                return {"is_locked": None}
-
-            entities.append(
-                EntitySpec(
-                    platform="lock",
-                    key="lock",
-                    name="门锁",
-                    state=lock_state,
-                    actions={
-                        "lock": _refusal_action("上锁"),
-                        "unlock": _refusal_action("开锁"),
-                    },
-                )
-            )
 
             # 门扇（只在语义明确的状态下判定）
             def door_state(device: DeviceContext) -> Mapping[str, Any]:
@@ -823,92 +1154,37 @@ class ProductKW5NAdapter:
                 )
             )
 
-        # --- 网络连通 -------------------------------------------------
-        if context.has_service(_NET_STATE_SID):
-            state_field = _field(profile, _NET_STATE_SID, _NET_STATE_FIELD)
-
-            def connectivity_state(device: DeviceContext) -> Mapping[str, Any]:
-                raw = _int(device.value(_NET_STATE_SID, _NET_STATE_FIELD))
-                if raw is None:
-                    return {"is_on": None}
-                return {"is_on": raw == _NET_STATE_ONLINE}
-
+        # --- 电池电量（只读） -----------------------------------------
+        # Profile 声明了 doorBattery / catEyeBattery；同系列机型实际可能
+        # 只通过未声明的 batteryManager 上报，故两者都查。
+        if context.has_service(_DOOR_BATTERY_SID) or context.has_service(
+            _BATTERY_MANAGER_SID
+        ):
             entities.append(
-                EntitySpec(
-                    platform="binary_sensor",
-                    key="connectivity",
-                    name="连接状态",
-                    state=connectivity_state,
-                    metadata={"device_class": "connectivity"},
+                _make_battery_sensor(
+                    _DOOR_BATTERY_SID,
+                    _LITHIUM_BATTERY_FIELD,
+                    "battery",
+                    "门锁电量",
+                )
+            )
+        if context.has_service(_CAT_EYE_BATTERY_SID) or context.has_service(
+            _BATTERY_MANAGER_SID
+        ):
+            entities.append(
+                _make_battery_sensor(
+                    _CAT_EYE_BATTERY_SID,
+                    _DRY_BATTERY_FIELD,
+                    "cat_eye_battery",
+                    "猫眼电量",
                 )
             )
 
-            def net_state_text(device: DeviceContext) -> Mapping[str, Any]:
-                raw = _int(device.value(_NET_STATE_SID, _NET_STATE_FIELD))
-                if raw is None:
-                    return {"native_value": None}
-                return {
-                    "native_value": _enum_label(state_field, raw) or str(raw)
-                }
-
-            entities.append(
-                EntitySpec(
-                    platform="sensor",
-                    key="network_state",
-                    name="网络状态",
-                    state=net_state_text,
-                    metadata={"entity_category": "diagnostic"},
-                )
-            )
-
-        # --- 电池 -----------------------------------------------------
-        if context.has_service(_DOOR_BATTERY_SID):
-            entities.append(
-                _battery_spec(_DOOR_BATTERY_SID, "door_battery", "门锁电量")
-            )
-        if context.has_service(_CAT_EYE_BATTERY_SID):
-            entities.append(
-                _battery_spec(_CAT_EYE_BATTERY_SID, "cat_eye_battery", "猫眼电量")
-            )
-
-        # --- 告警 -----------------------------------------------------
+        # --- 低电量告警（只读） ---------------------------------------
         if context.has_service(_LOCK_ALARM_SID):
-            alarm_field = _field(profile, _LOCK_ALARM_SID, _LOCK_ALARM_FIELD)
-            event_alarm_field = _field(
-                profile, _EVENT_SID, _EVENT_DOOR_ALARM_FIELD
-            )
-
-            def alarm_state(device: DeviceContext) -> Mapping[str, Any]:
-                value = _int(device.value(_LOCK_ALARM_SID, _LOCK_ALARM_FIELD))
-                if (
-                    value is not None
-                    and value >= 1
-                    and not _lock_alarm_is_stale(device)
-                ):
-                    return {
-                        "native_value": _enum_label(alarm_field, value) or str(value)
-                    }
-                code = _event_alarm_code(device)
-                if code is not None:
-                    return {
-                        "native_value": (
-                            _enum_label(event_alarm_field, code) or str(code)
-                        )
-                    }
-                if value is None and code is None:
-                    return {"native_value": None}
-                return {"native_value": _NO_ALARM}
-
-            entities.append(
-                EntitySpec(
-                    platform="sensor",
-                    key="alarm",
-                    name="门锁告警",
-                    state=alarm_state,
-                )
-            )
 
             def low_battery_state(device: DeviceContext) -> Mapping[str, Any]:
+                # 1) lockAlarm.alarm=2（Profile 声明；同系列机型常不上报）
                 value = _int(device.value(_LOCK_ALARM_SID, _LOCK_ALARM_FIELD))
                 if (
                     value is not None
@@ -916,8 +1192,16 @@ class ProductKW5NAdapter:
                     and not _lock_alarm_is_stale(device)
                 ):
                     return {"is_on": value == _ALARM_LOW_BATTERY}
-                # 回退到事件里的低电告警码（doorAlarmState=4）。
-                return {"is_on": _event_alarm_code(device) == 4}
+                # 2) batteryManager.lpmStatus=1（Profile 未声明，但同系列机型
+                #    的实际低电来源；读不到就不猜）
+                lpm = _int(device.value(_BATTERY_MANAGER_SID, _BATTERY_LPM_FIELD))
+                if lpm is not None:
+                    return {"is_on": lpm == _LPM_ACTIVE}
+                # 3) 最后回退到事件里的低电告警码（event.das=4）
+                alarm = _record_alarm(_event_record(device))
+                return {
+                    "is_on": alarm is not None and alarm == _EVENT_ALARM_LOW_BATTERY
+                }
 
             entities.append(
                 EntitySpec(
@@ -929,8 +1213,25 @@ class ProductKW5NAdapter:
                 )
             )
 
-        # --- 事件实体 -------------------------------------------------
+        # --- 门告警只读传感器 -----------------------------------------
+        # 逐码传感器：1 门未关 / 2 门虚掩 / 3 门未锁(故障) / 15 长时间未开门
+        # 数据来自 event 推送的缓存（见上方"事件缓存"说明）。
         if context.has_service(_EVENT_SID):
+            door_alarm_specs: dict[str, EntitySpec] = {}
+            for key, name, codes, status_codes in _DOOR_ALARM_SENSORS:
+                spec = _make_door_alarm_sensor(
+                    context, key, name, codes, status_codes, read_status
+                )
+                door_alarm_specs[key] = spec
+                entities.append(spec)
+
+            for key, name, members in _DOOR_GROUP_SENSORS:
+                specs = [door_alarm_specs[m] for m in members if m in door_alarm_specs]
+                if specs:
+                    entities.append(_make_group_alarm_sensor(name, specs))
+
+            # --- 事件实体（每次开锁 / 上锁 / 告警都 fire 一次） --------
+            # 状态实体只能表达"最近一次"，自动化请基于这个事件实体。
             entities.append(
                 EntitySpec(
                     platform="event",
@@ -945,115 +1246,7 @@ class ProductKW5NAdapter:
                 )
             )
 
-        # --- 设置开关 -------------------------------------------------
-        for sid, field_name, key, name in _SECURITY_SWITCHES:
-            if not context.has_service(sid):
-                continue
-            spec = _make_enum_switch(context, sid, field_name, key, name)
-            if spec is not None:
-                entities.append(spec)
-
-        for field_name, key, name in _ALARM_EVENT_SWITCHES:
-            if not context.has_service("alarmEventSetting"):
-                continue
-            spec = _make_enum_switch(
-                context, "alarmEventSetting", field_name, key, name
-            )
-            if spec is not None:
-                entities.append(spec)
-
-        for field_name, key, name in _CAT_EYE_SWITCHES:
-            if not context.has_service("catEyeSetting"):
-                continue
-            spec = _make_enum_switch(
-                context, "catEyeSetting", field_name, key, name
-            )
-            if spec is not None:
-                entities.append(spec)
-
-        if context.has_service("volumeSetting"):
-            spec = _make_enum_switch(
-                context, "volumeSetting", "nightModeSwitch", "night_mode", "夜间模式"
-            )
-            if spec is not None:
-                entities.append(spec)
-
-        # --- 设置下拉 -------------------------------------------------
-        for sid, field_name, key, name, order in _SELECT_SPECS:
-            if not context.has_service(sid):
-                continue
-            spec = _make_select(context, sid, field_name, key, name, order)
-            if spec is not None:
-                entities.append(spec)
-
-        # --- 诊断实体（默认关闭，见文件头说明） ----------------------
-        if _ENABLE_DIAGNOSTIC_ENTITIES:
-            entities.extend(_make_diagnostic_entities(context))
-
         return tuple(entities)
 
-
-
-def _make_diagnostic_entities(
-    context: DeviceContext,
-) -> tuple[EntitySpec, ...]:
-    """Build the netInfo / update diagnostic entities.
-
-    默认不创建（见 ``_ENABLE_DIAGNOSTIC_ENTITIES``）。代码保留是为了：
-    若日后在真机上确认这些字段**确实会上报**，把开关打开即可恢复，
-    无需重新实现。取值逻辑未做任何猜测，仍是按 Profile 的字段读取。
-    """
-
-    out: list[EntitySpec] = []
-
-    # --- 网络诊断 -------------------------------------------------
-    if context.has_service("netInfo"):
-        # 本机 intensity 是 0~100 连续整数（非同系列的 20/40/60/80/100
-        # 五档编码），故按原始数值输出，不做格数换算。
-        out.append(
-            _make_sensor(
-                "netInfo", "intensity", "wifi_signal_level",
-                "Wi-Fi 信号强度",
-                state_class="measurement", entity_category="diagnostic",
-                decode=_int,
-            )
-        )
-        out.append(
-            _make_sensor(
-                "netInfo", "RSSI", "wifi_rssi", "Wi-Fi RSSI",
-                unit="dBm", device_class="signal_strength",
-                state_class="measurement", entity_category="diagnostic",
-                decode=_int,
-            )
-        )
-        out.append(
-            _make_sensor(
-                "netInfo", "IP", "ip_address", "IP 地址",
-                entity_category="diagnostic", decode=_text,
-            )
-        )
-        out.append(
-            _make_sensor(
-                "netInfo", "SSID", "wifi_ssid", "Wi-Fi SSID",
-                entity_category="diagnostic", decode=_text,
-            )
-        )
-        out.append(
-            _make_sensor(
-                "netInfo", "BSSID", "bssid", "路由器 BSSID",
-                entity_category="diagnostic", decode=_text,
-            )
-        )
-
-    # --- 固件版本（诊断） -----------------------------------------
-    if context.has_service("update"):
-        out.append(
-            _make_sensor(
-                "update", "version", "firmware_version", "固件版本",
-                entity_category="diagnostic", decode=_text,
-            )
-        )
-
-    return tuple(out)
 
 ADAPTER = ProductKW5NAdapter()
